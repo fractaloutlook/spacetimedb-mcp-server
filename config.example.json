@@ -1,0 +1,14 @@
+{
+  "mcpServers": {
+    "spacetimedb": {
+      "command": "node",
+      "args": [
+        "E:\\AI\\claude\\spacetimedb-mcp-server\\dist\\index.js"
+      ],
+      "env": {
+        "SPACETIMEDB_URI": "ws://localhost:3000",
+        "SPACETIMEDB_MODULE": "your-module-name"
+      }
+    }
+  }
+}

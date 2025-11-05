@@ -1,0 +1,39 @@
+{
+  "name": "spacetimedb-mcp-server",
+  "version": "1.0.0",
+  "description": "Model Context Protocol server for SpacetimeDB - comprehensive database interface",
+  "type": "module",
+  "main": "dist/index.js",
+  "bin": {
+    "spacetimedb-mcp-server": "dist/index.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "watch": "tsc --watch",
+    "start": "node dist/index.js",
+    "dev": "tsc --watch & node --watch dist/index.js",
+    "prepare": "npm run build"
+  },
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "spacetimedb",
+    "database",
+    "real-time",
+    "multiplayer"
+  ],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.0.4",
+    "spacetimedb-sdk": "^1.0.0",
+    "zod": "^3.23.8"
+  },
+  "devDependencies": {
+    "@types/node": "^20.11.0",
+    "typescript": "^5.3.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
