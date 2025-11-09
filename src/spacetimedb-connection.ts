@@ -95,6 +95,7 @@ export class SpacetimeDBConnectionManager {
       // Use CLI to get database info
       const result = await this.executeCliCommand([
         "describe",
+        "--json",
         this.connectionState!.moduleName,
         "--server",
         this.connectionState!.uri,
@@ -226,6 +227,7 @@ export class SpacetimeDBConnectionManager {
     try {
       const result = await this.executeCliCommand([
         "describe",
+        "--json",
         this.connectionState!.moduleName,
         "--server",
         this.connectionState!.uri,
@@ -247,6 +249,7 @@ export class SpacetimeDBConnectionManager {
     try {
       const result = await this.executeCliCommand([
         "describe",
+        "--json",
         this.connectionState!.moduleName,
         "--server",
         this.connectionState!.uri,
@@ -368,70 +371,179 @@ export class SpacetimeDBConnectionManager {
   }
 
   /**
-   * Helper: Parse tables from describe output
+   * Helper: Parse tables from describe JSON output
    */
   private parseTablesFromDescribe(output: string): TableInfo[] {
-    // Simple parser - in production, use proper parsing
-    const lines = output.split("\n");
-    const tables: TableInfo[] = [];
+    try {
+      const schema = JSON.parse(output);
 
-    for (const line of lines) {
-      if (line.includes("Table:") || line.includes("table")) {
-        const match = line.match(/(\w+)/);
-        if (match) {
-          tables.push({ name: match[1] });
-        }
+      if (schema.tables && Array.isArray(schema.tables)) {
+        return schema.tables.map((table: any) => ({
+          name: table.name,
+          rowCount: undefined, // Not provided by describe
+          schema: table,
+        }));
       }
-    }
 
-    return tables.length > 0 ? tables : this.getMockTables();
+      return this.getMockTables();
+    } catch (error) {
+      console.error('Failed to parse tables from describe output:', error);
+      return this.getMockTables();
+    }
   }
 
   /**
-   * Helper: Parse SQL result
+   * Helper: Parse SQL result (pipe-delimited table format)
+   *
+   * Example format:
+   * column1 | column2 | column3
+   * --------+---------+---------
+   * value1  | value2  | value3
    */
   private parseSqlResult(output: string): any[] {
     try {
-      // Attempt to parse as JSON
+      // First, attempt to parse as JSON (in case format changes)
       const parsed = JSON.parse(output);
       return Array.isArray(parsed) ? parsed : [parsed];
     } catch {
-      // If not JSON, try to parse as table format
-      return [];
-    }
-  }
+      // Parse pipe-delimited table format
+      const lines = output.trim().split('\n');
 
-  /**
-   * Helper: Parse schema from describe output
-   */
-  private parseSchemaFromDescribe(output: string, tableName?: string): any {
-    // Simplified schema parser
-    return {
-      database: this.connectionState?.moduleName,
-      tables: tableName ? [{ name: tableName, columns: [] }] : [],
-    };
-  }
+      if (lines.length < 2) {
+        return [];
+      }
 
-  /**
-   * Helper: Parse reducers from describe output
-   */
-  private parseReducersFromDescribe(output: string, includeSignatures: boolean): any[] {
-    const lines = output.split("\n");
-    const reducers: any[] = [];
+      // First line contains column headers
+      const headers = lines[0]
+        .split('|')
+        .map(h => h.trim())
+        .filter(h => h.length > 0);
 
-    for (const line of lines) {
-      if (line.includes("Reducer:") || line.includes("reducer")) {
-        const match = line.match(/(\w+)/);
-        if (match) {
-          reducers.push({
-            name: match[1],
-            signature: includeSignatures ? "(...args: any[]) => void" : undefined,
+      if (headers.length === 0) {
+        return [];
+      }
+
+      // Second line is separator (skip it)
+      // Remaining lines are data rows
+      const rows: any[] = [];
+
+      for (let i = 2; i < lines.length; i++) {
+        const line = lines[i].trim();
+        if (!line) continue;
+
+        const values = line
+          .split('|')
+          .map(v => v.trim())
+          .filter((_, index) => index < headers.length);
+
+        if (values.length > 0) {
+          const row: any = {};
+          headers.forEach((header, index) => {
+            let value: any = values[index] || null;
+
+            // Try to parse quoted strings
+            if (typeof value === 'string' && value.startsWith('"') && value.endsWith('"')) {
+              value = value.slice(1, -1);
+            }
+            // Try to parse numbers
+            else if (typeof value === 'string' && /^-?\d+(\.\d+)?$/.test(value)) {
+              value = parseFloat(value);
+            }
+            // Try to parse booleans
+            else if (value === 'true') {
+              value = true;
+            } else if (value === 'false') {
+              value = false;
+            }
+
+            row[header] = value;
           });
+          rows.push(row);
         }
       }
+
+      return rows;
+    }
+  }
+
+  /**
+   * Helper: Parse schema from describe JSON output
+   */
+  private parseSchemaFromDescribe(output: string, tableName?: string): any {
+    try {
+      const schema = JSON.parse(output);
+
+      // If a specific table is requested, filter to just that table
+      if (tableName && schema.tables && Array.isArray(schema.tables)) {
+        const table = schema.tables.find((t: any) => t.name === tableName);
+        if (table) {
+          return {
+            database: this.connectionState?.moduleName,
+            typespace: schema.typespace,
+            tables: [table],
+          };
+        }
+      }
+
+      // Return the full schema
+      return {
+        database: this.connectionState?.moduleName,
+        typespace: schema.typespace,
+        tables: schema.tables || [],
+        reducers: schema.reducers || [],
+      };
+    } catch (error) {
+      console.error('Failed to parse schema from describe output:', error);
+      return this.getMockSchema(tableName);
+    }
+  }
+
+  /**
+   * Helper: Parse reducers from describe JSON output
+   */
+  private parseReducersFromDescribe(output: string, includeSignatures: boolean): any[] {
+    try {
+      const schema = JSON.parse(output);
+
+      if (schema.reducers && Array.isArray(schema.reducers)) {
+        return schema.reducers.map((reducer: any) => {
+          const result: any = {
+            name: reducer.name,
+            lifecycle: reducer.lifecycle,
+          };
+
+          if (includeSignatures && reducer.params && reducer.params.elements) {
+            result.params = reducer.params.elements;
+            result.signature = this.formatReducerSignature(reducer);
+          }
+
+          return result;
+        });
+      }
+
+      return this.getMockReducers(includeSignatures);
+    } catch (error) {
+      console.error('Failed to parse reducers from describe output:', error);
+      return this.getMockReducers(includeSignatures);
+    }
+  }
+
+  /**
+   * Helper: Format reducer signature for display
+   */
+  private formatReducerSignature(reducer: any): string {
+    if (!reducer.params || !reducer.params.elements || !Array.isArray(reducer.params.elements)) {
+      return '() => void';
     }
 
-    return reducers.length > 0 ? reducers : this.getMockReducers(includeSignatures);
+    const paramList = reducer.params.elements
+      .map((param: any, index: number) => {
+        const paramName = param.name || `arg${index}`;
+        return paramName;
+      })
+      .join(', ');
+
+    return `(${paramList}) => void`;
   }
 
   /**
