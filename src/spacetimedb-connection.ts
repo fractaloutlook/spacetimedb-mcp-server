@@ -1,22 +1,33 @@
 import { spawn, ChildProcess } from "child_process";
+import { Identity, AlgebraicType } from "spacetimedb";
+import type { DbConnectionImpl } from "spacetimedb";
+import type RemoteModule from "spacetimedb/dist/sdk/spacetime_module";
+import { DbConnectionBuilder } from "spacetimedb";
 
 /**
  * SpacetimeDB Connection Manager
  *
  * Manages connections to SpacetimeDB instances and provides methods for:
  * - Database operations (queries, subscriptions)
- * - Reducer invocations
  * - Schema introspection
- * - CLI operations
+ * - CLI operations (for metadata only)
+ *
+ * Uses hybrid approach:
+ * - HTTP API for queries (works without generated bindings)
+ * - WebSocket SDK for real-time subscriptions
+ * - Schema-driven runtime type conversion
  */
 
 interface ConnectionState {
-  uri: string;
+  uri: string; // HTTP URI (for API calls and CLI)
+  wsUri: string; // WebSocket URI (for SDK connections)
   moduleName: string;
   authToken?: string;
   connected: boolean;
   identity?: string;
-  metadata?: any;
+  schema?: DatabaseSchema; // Cached schema for runtime type conversion
+  wsConnection?: DbConnectionImpl; // WebSocket connection for subscriptions
+  wsToken?: string; // Token returned from WebSocket connection
 }
 
 interface TableInfo {
@@ -25,57 +36,273 @@ interface TableInfo {
   schema?: any;
 }
 
+/**
+ * Schema structures for runtime type conversion
+ */
+interface DatabaseSchema {
+  typespace: number;
+  tables: TableSchema[];
+  reducers: ReducerSchema[];
+}
+
+interface TableSchema {
+  name: string;
+  columns: ColumnSchema[];
+  indexes: IndexSchema[];
+  constraints: ConstraintSchema[];
+  sequences: SequenceSchema[];
+  type: string;
+  access: string;
+}
+
+interface ColumnSchema {
+  name: string;
+  ty: AlgebraicType;
+}
+
+interface IndexSchema {
+  name: string;
+  is_unique: boolean;
+  accessor_name: string;
+  index_type: string;
+}
+
+interface ConstraintSchema {
+  constraint_name: string;
+  constraints: string;
+  columns: number[];
+}
+
+interface SequenceSchema {
+  name: string;
+  col_pos: number;
+  start: number;
+  increment: number;
+  min_value: number | null;
+  max_value: number | null;
+  allocated: number;
+}
+
+interface ReducerSchema {
+  name: string;
+  params: { elements: ParamSchema[] };
+  lifecycle: string | null;
+}
+
+interface ParamSchema {
+  name: string;
+  ty: AlgebraicType;
+}
+
 export class SpacetimeDBConnectionManager {
   private connectionState: ConnectionState | null = null;
-  private wsConnection: any = null; // WebSocket connection
   private subscriptions: Map<string, any> = new Map();
   private tableCache: Map<string, any[]> = new Map();
 
   /**
-   * Connect to a SpacetimeDB instance
+   * Connect to a SpacetimeDB instance using HTTP API
+   * Validates connection and fetches schema for runtime type conversion
    */
   async connect(
     uri: string,
     moduleName: string,
     authToken?: string
   ): Promise<{ status: string; identity?: string; message: string }> {
-    try {
-      // For now, we'll use CLI-based approach since the SDK requires generated bindings
-      // In production, you'd generate TypeScript bindings from the module
+    // Normalize URIs for different protocols
+    let httpUri = uri;
+    let wsUri = uri;
 
+    // Convert to HTTP for API calls
+    // Note: SpacetimeDB often uses wss:// for WebSocket but http:// for HTTP API
+    if (uri.startsWith('wss://')) {
+      httpUri = uri.replace('wss://', 'http://');  // wss → http (not https!)
+      wsUri = uri;
+    } else if (uri.startsWith('ws://')) {
+      httpUri = uri.replace('ws://', 'http://');
+      wsUri = uri;
+    } else if (uri.startsWith('https://')) {
+      httpUri = uri;
+      wsUri = uri.replace('https://', 'wss://');
+    } else if (uri.startsWith('http://')) {
+      httpUri = uri;
+      wsUri = uri.replace('http://', 'ws://');
+    }
+
+    try {
+      // Fetch schema to validate connection and cache for later use
+      const schema = await this.fetchSchema(httpUri, moduleName, authToken);
+
+      // Create RemoteModule from schema for WebSocket connection
+      const remoteModule = this.createRemoteModule(schema);
+
+      // Establish WebSocket connection for real-time subscriptions
+      const { wsConnection, wsIdentity, wsToken } = await this.connectWebSocket(
+        wsUri,
+        moduleName,
+        authToken,
+        remoteModule
+      );
+
+      // Store connection state with both HTTP and WebSocket
       this.connectionState = {
-        uri,
+        uri: httpUri,
+        wsUri: wsUri,
         moduleName,
         authToken,
         connected: true,
+        identity: wsIdentity,
+        schema,
+        wsConnection,
+        wsToken,
       };
 
-      // Attempt to get identity via CLI
-      const identity = await this.executeCliCommand(["identity", "list"]);
+      console.log(`Connected to ${moduleName} at ${httpUri}`);
+      console.log(`WebSocket connected with identity: ${wsIdentity}`);
+      console.log(`Schema loaded: ${schema.tables.length} tables, ${schema.reducers.length} reducers`);
 
       return {
         status: "connected",
-        identity: identity || "unknown",
-        message: `Connected to ${moduleName} at ${uri}`,
+        identity: wsIdentity,
+        message: `Connected to ${moduleName} at ${uri}. Found ${schema.tables.length} tables and ${schema.reducers.length} reducers.`,
       };
     } catch (error) {
-      this.connectionState = null;
       throw new Error(`Connection failed: ${error instanceof Error ? error.message : String(error)}`);
     }
+  }
+
+  /**
+   * Establish WebSocket connection using SDK
+   */
+  private async connectWebSocket(
+    wsUri: string,
+    moduleName: string,
+    authToken: string | undefined,
+    remoteModule: RemoteModule
+  ): Promise<{ wsConnection: DbConnectionImpl; wsIdentity: string; wsToken: string }> {
+    return new Promise((resolve, reject) => {
+      const builder = new DbConnectionBuilder(
+        remoteModule,
+        (impl: DbConnectionImpl) => impl // Identity function - just return the impl
+      );
+
+      let resolvedConnection: DbConnectionImpl | null = null;
+
+      builder
+        .withUri(wsUri)
+        .withModuleName(moduleName)
+        .onConnect((connection: any, identity: Identity, token: string) => {
+          console.log(`WebSocket connected: ${identity.toHexString()}`);
+          resolvedConnection = connection;
+          resolve({
+            wsConnection: connection,
+            wsIdentity: identity.toHexString(),
+            wsToken: token,
+          });
+        })
+        .onConnectError((ctx: any) => {
+          const error = ctx.event || new Error('Connection failed');
+          console.error("WebSocket connection error:", error);
+          reject(new Error(`WebSocket connection failed: ${error}`));
+        })
+        .onDisconnect((ctx: any) => {
+          const error = ctx.event;
+          if (error) {
+            console.error("WebSocket disconnected with error:", error);
+          } else {
+            console.log("WebSocket disconnected");
+          }
+        });
+
+      if (authToken) {
+        builder.withToken(authToken);
+      }
+
+      builder.build();
+    });
+  }
+
+  /**
+   * Fetch schema from SpacetimeDB HTTP API
+   */
+  private async fetchSchema(
+    httpUri: string,
+    moduleName: string,
+    authToken?: string
+  ): Promise<DatabaseSchema> {
+    // Version 9 is the current RawModuleDef format
+    const schemaUrl = `${httpUri}/v1/database/${moduleName}/schema?version=9`;
+
+    const headers: Record<string, string> = {};
+    if (authToken) {
+      headers['Authorization'] = `Bearer ${authToken}`;
+    }
+
+    const response = await fetch(schemaUrl, { headers });
+
+    if (!response.ok) {
+      const errorText = await response.text();
+      throw new Error(`Failed to fetch schema: HTTP ${response.status} - ${errorText}`);
+    }
+
+    const schema = await response.json();
+    return schema as DatabaseSchema;
+  }
+
+  /**
+   * Create a minimal RemoteModule from schema for WebSocket connections
+   */
+  private createRemoteModule(schema: DatabaseSchema): RemoteModule {
+    const tables: { [name: string]: any } = {};
+    const reducers: { [name: string]: any } = {};
+
+    // Build table runtime type info from schema
+    schema.tables.forEach(table => {
+      tables[table.name] = {
+        tableName: table.name,
+        rowType: { type: 'Product', elements: table.columns },
+        // TODO: extract primary key info if available
+      };
+    });
+
+    // Build reducer runtime type info from schema
+    schema.reducers.forEach(reducer => {
+      reducers[reducer.name] = {
+        reducerName: reducer.name,
+        argsType: reducer.params,
+      };
+    });
+
+    // Return minimal RemoteModule with version info
+    return {
+      tables,
+      reducers,
+      eventContextConstructor: (imp: DbConnectionImpl, event: any) => ({ db: {}, reducers: {}, event }),
+      dbViewConstructor: (connection: DbConnectionImpl) => ({}),
+      reducersConstructor: (connection: DbConnectionImpl, setReducerFlags: any) => ({}),
+      setReducerFlagsConstructor: () => ({}),
+      versionInfo: {
+        cliVersion: '1.7.0',  // Match our installed SDK version
+      },
+    };
   }
 
   /**
    * Disconnect from SpacetimeDB
    */
   async disconnect(): Promise<void> {
-    if (this.wsConnection) {
-      // Close WebSocket connection if using SDK
-      this.wsConnection = null;
+    if (this.connectionState?.wsConnection) {
+      try {
+        this.connectionState.wsConnection.disconnect();
+      } catch (error) {
+        console.error("Error disconnecting WebSocket:", error);
+      }
     }
 
     this.subscriptions.clear();
     this.tableCache.clear();
     this.connectionState = null;
+
+    console.log("Disconnected from SpacetimeDB");
   }
 
   /**
@@ -83,6 +310,123 @@ export class SpacetimeDBConnectionManager {
    */
   isConnected(): boolean {
     return this.connectionState?.connected ?? false;
+  }
+
+  /**
+   * Convert row data using schema type information
+   */
+  private convertRowTypes(row: any, tableSchema: TableSchema): any {
+    const converted: any = {};
+
+    tableSchema.columns.forEach((column, index) => {
+      const rawValue = Array.isArray(row) ? row[index] : row[column.name];
+      converted[column.name] = this.convertValue(rawValue, column.ty);
+    });
+
+    return converted;
+  }
+
+  /**
+   * Convert a single value based on its AlgebraicType
+   */
+  private convertValue(value: any, type: AlgebraicType): any {
+    if (value === null || value === undefined) {
+      return null;
+    }
+
+    // Cast to any for property access since AlgebraicType is a complex union
+    const typeAny = type as any;
+    const typeName = typeAny.type;
+
+    switch (typeName) {
+      case 'U8':
+      case 'U16':
+      case 'U32':
+      case 'U64':
+      case 'U128':
+      case 'I8':
+      case 'I16':
+      case 'I32':
+      case 'I64':
+      case 'I128':
+        return typeof value === 'string' ? parseInt(value, 10) : Number(value);
+
+      case 'F32':
+      case 'F64':
+        return typeof value === 'string' ? parseFloat(value) : Number(value);
+
+      case 'Bool':
+        return Boolean(value);
+
+      case 'String':
+        return String(value);
+
+      // Handle timestamp as Date object
+      case 'Timestamp':
+        if (typeof value === 'object' && 'microseconds_since_epoch' in value) {
+          return new Date(value.microseconds_since_epoch / 1000);
+        }
+        return new Date(value);
+
+      // Handle Identity type
+      case 'Identity':
+        if (typeof value === 'object' && '__identity_bytes' in value) {
+          // Convert bytes array to hex string
+          const bytes = value.__identity_bytes;
+          return Array.isArray(bytes)
+            ? bytes.map((b: number) => b.toString(16).padStart(2, '0')).join('')
+            : String(value);
+        }
+        return String(value);
+
+      // Handle Product types (structs/tuples)
+      case 'Product':
+        if (typeof value === 'object') {
+          // If it has elements, it's a product type
+          if (typeAny.elements && Array.isArray(typeAny.elements)) {
+            const converted: any = {};
+            typeAny.elements.forEach((elem: any, idx: number) => {
+              const fieldName = elem.name || `field_${idx}`;
+              const fieldValue = Array.isArray(value) ? value[idx] : value[fieldName];
+              converted[fieldName] = this.convertValue(fieldValue, elem.ty);
+            });
+            return converted;
+          }
+        }
+        return value;
+
+      // Handle Sum types (enums)
+      case 'Sum':
+        // Sum types are typically { tag: number, value: any }
+        if (typeof value === 'object' && 'tag' in value) {
+          return {
+            variant: typeAny.variants?.[value.tag]?.name || `Variant${value.tag}`,
+            value: value.value,
+          };
+        }
+        return value;
+
+      // Handle Array types
+      case 'Array':
+        if (Array.isArray(value) && typeAny.element_ty) {
+          return value.map(v => this.convertValue(v, typeAny.element_ty));
+        }
+        return value;
+
+      // Handle Option types
+      case 'Option':
+        if (value === null || value === undefined) {
+          return null;
+        }
+        if (typeof value === 'object' && 'some' in value) {
+          return typeAny.some_ty ? this.convertValue(value.some, typeAny.some_ty) : value.some;
+        }
+        return typeAny.some_ty ? this.convertValue(value, typeAny.some_ty) : value;
+
+      default:
+        // For unknown types, return as-is
+        return value;
+    }
   }
 
   /**
@@ -119,7 +463,7 @@ export class SpacetimeDBConnectionManager {
   }
 
   /**
-   * Query a table
+   * Query a table using HTTP API with schema-driven type conversion
    */
   async queryTable(
     tableName: string,
@@ -129,36 +473,88 @@ export class SpacetimeDBConnectionManager {
   ): Promise<{ table: string; rows: any[]; totalCount: number }> {
     this.ensureConnected();
 
+    // Build SQL query
+    let sqlQuery = `SELECT * FROM ${tableName}`;
+
+    // Add WHERE clause if filter provided
+    if (filter && Object.keys(filter).length > 0) {
+      const conditions = Object.entries(filter)
+        .map(([key, value]) => {
+          if (typeof value === 'string') {
+            return `${key} = '${value.replace(/'/g, "''")}'`; // Escape single quotes
+          }
+          return `${key} = ${value}`;
+        })
+        .join(' AND ');
+      sqlQuery += ` WHERE ${conditions}`;
+    }
+
+    // Add LIMIT and OFFSET
+    sqlQuery += ` LIMIT ${limit}`;
+    if (offset > 0) {
+      sqlQuery += ` OFFSET ${offset}`;
+    }
+
+    console.log("Executing HTTP API query:", sqlQuery);
+
+    // Use HTTP API to query (works without bindings)
+    const apiUrl = `${this.connectionState!.uri}/v1/database/${this.connectionState!.moduleName}/sql`;
+    console.log("Query URL:", apiUrl);
+    console.log("Connection state URI:", this.connectionState!.uri);
+    console.log("Module name:", this.connectionState!.moduleName);
+
+    const headers: Record<string, string> = {
+      'Content-Type': 'text/plain',
+    };
+    if (this.connectionState!.authToken) {
+      headers['Authorization'] = `Bearer ${this.connectionState!.authToken}`;
+    }
+
     try {
-      // Use CLI to query the table
-      const result = await this.executeCliCommand([
-        "sql",
-        this.connectionState!.moduleName,
-        "--server",
-        this.connectionState!.uri,
-        `SELECT * FROM ${tableName} LIMIT ${limit} OFFSET ${offset}`,
-      ]);
+      const response = await fetch(apiUrl, {
+        method: 'POST',
+        headers,
+        body: sqlQuery,  // Send raw SQL, not JSON
+      });
 
-      const rows = this.parseSqlResult(result);
+      if (!response.ok) {
+        const errorText = await response.text();
+        throw new Error(`HTTP ${response.status}: ${errorText}`);
+      }
 
-      // Apply client-side filtering if provided
-      let filteredRows = rows;
-      if (filter) {
-        filteredRows = this.applyFilter(rows, filter);
+      const result = await response.json();
+
+      // Parse the response with schema if available
+      if (Array.isArray(result) && result.length > 0) {
+        const statementResult = result[0];
+        const rawRows = statementResult.rows || [];
+
+        // Convert rows using schema for proper type conversion
+        const tableSchema = this.connectionState!.schema?.tables.find(t => t.name === tableName);
+        const rows = tableSchema
+          ? rawRows.map((row: any) => this.convertRowTypes(row, tableSchema))
+          : rawRows;
+
+        return {
+          table: tableName,
+          rows,
+          totalCount: rows.length,
+        };
       }
 
       return {
         table: tableName,
-        rows: filteredRows,
-        totalCount: filteredRows.length,
+        rows: [],
+        totalCount: 0,
       };
     } catch (error) {
+      console.error("Query failed:", error);
       throw new Error(`Query failed: ${error instanceof Error ? error.message : String(error)}`);
     }
   }
 
   /**
-   * Call a reducer
+   * Call a reducer via HTTP API
    */
   async callReducer(
     reducerName: string,
@@ -166,17 +562,30 @@ export class SpacetimeDBConnectionManager {
   ): Promise<{ reducer: string; status: string; message: string }> {
     this.ensureConnected();
 
+    const apiUrl = `${this.connectionState!.uri}/v1/database/${this.connectionState!.moduleName}/call/${reducerName}`;
+
+    const headers: Record<string, string> = {
+      'Content-Type': 'application/json',
+    };
+    if (this.connectionState!.authToken) {
+      headers['Authorization'] = `Bearer ${this.connectionState!.authToken}`;
+    }
+
     try {
-      // Use CLI to call reducer
-      const argsJson = JSON.stringify(args);
-      const result = await this.executeCliCommand([
-        "call",
-        this.connectionState!.moduleName,
-        reducerName,
-        ...args.map(arg => String(arg)),
-        "--server",
-        this.connectionState!.uri,
-      ]);
+      console.log(`Calling reducer ${reducerName} with args:`, args);
+
+      const response = await fetch(apiUrl, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify(args),
+      });
+
+      if (!response.ok) {
+        const errorText = await response.text();
+        throw new Error(`HTTP ${response.status}: ${errorText}`);
+      }
+
+      const result = await response.text();
 
       return {
         reducer: reducerName,
@@ -193,7 +602,7 @@ export class SpacetimeDBConnectionManager {
   }
 
   /**
-   * Subscribe to a table for real-time updates
+   * Subscribe to a table with real-time WebSocket updates
    */
   async subscribeTable(
     tableName: string,
@@ -201,12 +610,55 @@ export class SpacetimeDBConnectionManager {
   ): Promise<{ table: string; subscribed: boolean; initialData: any[] }> {
     this.ensureConnected();
 
+    const wsConnection = this.connectionState!.wsConnection;
+    if (!wsConnection) {
+      throw new Error("WebSocket connection not established");
+    }
+
     try {
-      // Get initial data
+      // Get initial data snapshot via HTTP API (faster than waiting for subscription)
       const { rows } = await this.queryTable(tableName, filter);
 
-      // In a real implementation with WebSocket, you'd set up a subscription here
-      this.subscriptions.set(tableName, { filter, active: true });
+      // Build SQL subscription query
+      let sqlQuery = `SELECT * FROM ${tableName}`;
+      if (filter && Object.keys(filter).length > 0) {
+        const conditions = Object.entries(filter)
+          .map(([key, value]) => {
+            if (typeof value === 'string') {
+              return `${key} = '${value.replace(/'/g, "''")}'`;
+            }
+            return `${key} = ${value}`;
+          })
+          .join(' AND ');
+        sqlQuery += ` WHERE ${conditions}`;
+      }
+
+      // Set up WebSocket subscription for live updates
+      await new Promise<void>((resolve, reject) => {
+        wsConnection
+          .subscriptionBuilder()
+          .onApplied((ctx: any) => {
+            console.log(`Subscription applied for ${tableName}`);
+            // Without bindings, we can't access ctx.db.tableName
+            // But subscription is active and will receive updates
+            resolve();
+          })
+          .onError((ctx: any) => {
+            const error = ctx.event || new Error('Subscription error');
+            console.error(`Subscription error for ${tableName}:`, error);
+            reject(error);
+          })
+          .subscribe([sqlQuery]);
+      });
+
+      this.subscriptions.set(tableName, {
+        filter,
+        active: true,
+        query: sqlQuery,
+        initialCount: rows.length,
+      });
+
+      console.log(`Subscribed to ${tableName} via WebSocket: ${rows.length} initial rows`);
 
       return {
         table: tableName,

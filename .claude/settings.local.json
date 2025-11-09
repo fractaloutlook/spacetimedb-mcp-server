@@ -1,0 +1,17 @@
+{
+  "permissions": {
+    "allow": [
+      "WebFetch(domain:code.claude.com)",
+      "WebSearch",
+      "Bash(spacetime list:*)",
+      "Bash(npm run build:*)",
+      "Bash(git fetch:*)",
+      "WebFetch(domain:spacetimedb.com)",
+      "Bash(cat:*)",
+      "Bash(spacetime version:*)",
+      "Bash(spacetime sql status-module:*)"
+    ],
+    "deny": [],
+    "ask": []
+  }
+}

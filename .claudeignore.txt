@@ -1,0 +1,8 @@
+node_modules/
+dist/
+build/
+target/
+*.log
+.git/
+.claude/docs/  # only pull these in explicitly when needed
+test-data/
